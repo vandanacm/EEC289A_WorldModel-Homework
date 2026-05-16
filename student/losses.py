@@ -8,7 +8,22 @@ import torch.nn.functional as F
 from .rollout import open_loop_rollout
 
 
-def one_step_delta_loss(model, states: torch.Tensor, actions: torch.Tensor, normalizer) -> torch.Tensor:
+def _regression(pred: torch.Tensor, target: torch.Tensor, *, loss_type: str) -> torch.Tensor:
+    if loss_type == "smooth_l1":
+        return F.smooth_l1_loss(pred, target, beta=0.05)
+    if loss_type == "mse":
+        return F.mse_loss(pred, target)
+    raise ValueError(f"Unknown loss_type={loss_type!r}; expected 'mse' or 'smooth_l1'.")
+
+
+def one_step_delta_loss(
+    model,
+    states: torch.Tensor,
+    actions: torch.Tensor,
+    normalizer,
+    *,
+    loss_type: str = "mse",
+) -> torch.Tensor:
     obs = states[:, :-1].reshape(-1, states.shape[-1])
     act = actions.reshape(-1, actions.shape[-1])
     target_delta = (states[:, 1:] - states[:, :-1]).reshape(-1, states.shape[-1])
@@ -16,12 +31,20 @@ def one_step_delta_loss(model, states: torch.Tensor, actions: torch.Tensor, norm
     act_norm = normalizer.normalize_act(act)
     target_norm = normalizer.normalize_delta(target_delta)
     pred_norm, _ = model(obs_norm, act_norm, None)
-    return F.mse_loss(pred_norm, target_norm)
+    return _regression(pred_norm, target_norm, loss_type=loss_type)
 
 
-def rollout_loss(model, states: torch.Tensor, actions: torch.Tensor, normalizer, warmup_steps: int, horizon: int) -> torch.Tensor:
-    # Train local open-loop stability at random positions, not only at the
-    # beginning of each stored window.
+def rollout_loss(
+    model,
+    states: torch.Tensor,
+    actions: torch.Tensor,
+    normalizer,
+    warmup_steps: int,
+    horizon: int,
+    *,
+    milestones: list[int] | None = None,
+    loss_type: str = "mse",
+) -> torch.Tensor:
     needed_states = int(warmup_steps) + int(horizon) + 1
     if states.shape[1] < needed_states:
         raise ValueError(
@@ -39,17 +62,41 @@ def rollout_loss(model, states: torch.Tensor, actions: torch.Tensor, normalizer,
     targets = sub_states[:, warmup_steps + 1 : warmup_steps + 1 + horizon]
     pred_norm = normalizer.normalize_obs(preds)
     target_norm = normalizer.normalize_obs(targets)
-    return F.mse_loss(pred_norm, target_norm)
+
+    if milestones:
+        caps = sorted({int(m) for m in milestones if 1 <= int(m) <= int(horizon)})
+        if not caps:
+            caps = [int(horizon)]
+        parts = []
+        for h in caps:
+            parts.append(_regression(pred_norm[:, :h], target_norm[:, :h], loss_type=loss_type))
+        return torch.stack(parts, dim=0).mean()
+
+    return _regression(pred_norm, target_norm, loss_type=loss_type)
 
 
 def compute_loss(model, batch: dict[str, torch.Tensor], normalizer, cfg: dict):
     loss_cfg = cfg["loss"]
     states = batch["states"]
     actions = batch["actions"]
-    one = one_step_delta_loss(model, states, actions, normalizer)
+    one_type = str(loss_cfg.get("one_step_loss", "mse"))
+    roll_type = str(loss_cfg.get("rollout_loss", "mse"))
+    one = one_step_delta_loss(model, states, actions, normalizer, loss_type=one_type)
     horizon = int(loss_cfg.get("rollout_train_horizon", 5))
     warmup = int(cfg["eval"].get("warmup_steps", 5))
-    roll = rollout_loss(model, states, actions, normalizer, warmup_steps=warmup, horizon=horizon)
+    milestones = loss_cfg.get("rollout_milestones")
+    if milestones is not None:
+        milestones = [int(m) for m in milestones]
+    roll = rollout_loss(
+        model,
+        states,
+        actions,
+        normalizer,
+        warmup_steps=warmup,
+        horizon=horizon,
+        milestones=milestones,
+        loss_type=roll_type,
+    )
     total = float(loss_cfg.get("one_step_weight", 1.0)) * one + float(loss_cfg.get("rollout_weight", 0.3)) * roll
     return total, {
         "loss/total": float(total.detach().cpu()),
